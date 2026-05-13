@@ -1,65 +1,22 @@
-from flask import Flask, render_template, jsonify, request
+import gradio as gr
 import joblib
 import numpy as np
-import pandas as pd
 import os
 
-app = Flask(__name__)
-
-# ── MatrixFactorization class (must match Colab definition) ──
-class MatrixFactorization:
-    def __init__(self, n_users, n_items, n_factors=15, lr=0.005, reg=0.02, n_epochs=40):
-        self.K, self.lr, self.reg, self.n_epochs = n_factors, lr, reg, n_epochs
-        scale    = 1 / np.sqrt(n_factors)
-        self.P   = np.random.normal(0, scale, (n_users,  n_factors))
-        self.Q   = np.random.normal(0, scale, (n_items,  n_factors))
-        self.bu  = np.zeros(n_users)
-        self.bi  = np.zeros(n_items)
-        self.mu  = 0.0
-
-    def fit(self, train_data, val_data=None):
-        self.mu = np.mean([r for _, _, r in train_data])
-        self.train_losses, self.val_losses = [], []
-        for epoch in range(self.n_epochs):
-            np.random.shuffle(train_data)
-            sq_loss = 0.0
-            for u, i, r in train_data:
-                pred     = self.mu + self.bu[u] + self.bi[i] + self.P[u] @ self.Q[i]
-                err      = r - pred
-                sq_loss += err ** 2
-                self.bu[u] += self.lr * (err - self.reg * self.bu[u])
-                self.bi[i] += self.lr * (err - self.reg * self.bi[i])
-                pu_old      = self.P[u].copy()
-                self.P[u]  += self.lr * (err * self.Q[i] - self.reg * self.P[u])
-                self.Q[i]  += self.lr * (err * pu_old   - self.reg * self.Q[i])
-            train_rmse = np.sqrt(sq_loss / len(train_data))
-            self.train_losses.append(train_rmse)
-            if val_data:
-                val_errs = [(r - self.predict(u, i))**2 for u, i, r in val_data]
-                self.val_losses.append(np.sqrt(np.mean(val_errs)))
-
-    def predict(self, u, i):
-        return float(np.clip(self.mu + self.bu[u] + self.bi[i] + self.P[u] @ self.Q[i], 1, 5))
-
-    def recommend(self, user_id, rated_pids, top_n=10):
-        scores = [(i, self.predict(user_id, i))
-                  for i in range(self.Q.shape[0]) if i not in rated_pids]
-        return sorted(scores, key=lambda x: x[1], reverse=True)[:top_n]
-
-
-# ── Load artifacts ────────────────────────────────────────────
-MODEL_PATH = 'mf_model.joblib'
-DATA_PATH  = 'recommender_data.joblib'
+# ── Load artifacts ─────────────────────────────
+MODEL_PATH = "mf_model.joblib"
+DATA_PATH  = "recommender_data.joblib"
 
 mf = data = products_df = rating_matrix = None
 item_sim = user_sim = reconstructed = user_mean = users_df = None
+artifacts_loaded = False
 
 def load_artifacts():
-    global mf, data, products_df, rating_matrix, item_sim
-    global user_sim, reconstructed, user_mean, users_df
+    global mf, data, products_df, rating_matrix
+    global item_sim, user_sim, reconstructed, user_mean, users_df
+    global artifacts_loaded
 
     if not os.path.exists(MODEL_PATH) or not os.path.exists(DATA_PATH):
-        print("Model files not found.")
         return False
 
     mf   = joblib.load(MODEL_PATH)
@@ -73,77 +30,62 @@ def load_artifacts():
     user_mean     = data['user_mean']
     users_df      = data['users_df']
 
-    print(f"Loaded | {len(users_df)} users | {len(products_df)} products")
+    artifacts_loaded = True
     return True
 
-artifacts_loaded = load_artifacts()
+load_artifacts()
 
 
-# ── Cart-based recommendation logic ──────────────────────────
-def recommend_from_cart(cart_product_ids, top_n=8):
-    cart_set    = set(cart_product_ids)
-    N           = len(products_df)
+# ── Recommendation logic (same as your Flask version) ──
+def recommend_from_cart(cart_text, top_n=8):
+    if not artifacts_loaded:
+        return "Model not loaded"
+
+    try:
+        cart_product_ids = [int(x.strip()) for x in cart_text.split(",") if x.strip()]
+    except:
+        return "Invalid input. Use comma-separated product IDs like: 1,2,3"
+
+    cart_set = set(cart_product_ids)
+    N = len(products_df)
     score_accum = np.zeros(N)
 
     for cid in cart_product_ids:
         score_accum += item_sim[cid]
 
     for cid in cart_set:
-        score_accum[cid] = 0.0
+        if cid < len(score_accum):
+            score_accum[cid] = 0.0
 
     score_accum /= max(len(cart_product_ids), 1)
-    top_ids      = np.argsort(score_accum)[::-1][:top_n]
+    top_ids = np.argsort(score_accum)[::-1][:top_n]
 
     results = []
     for pid in top_ids:
-        if score_accum[pid] <= 0:
+        if pid >= len(products_df) or score_accum[pid] <= 0:
             continue
-        row = products_df[products_df.product_id == int(pid)].iloc[0]
-        results.append({
-            'product_id': int(pid),
-            'product':    row.product_name,
-            'category':   row.category,
-            'price':      round(float(row.price), 2),
-            'similarity': round(float(score_accum[pid]), 4),
-        })
-    return results
+
+        row = products_df.iloc[pid]
+        results.append(
+            f"{row['product_name']} | {row['category']} | ${round(float(row['price']),2)}"
+        )
+
+    return "\n".join(results) if results else "No recommendations found"
 
 
-# ── Routes ────────────────────────────────────────────────────
-@app.route('/')
-def index():
-    if not artifacts_loaded:
-        return render_template('index.html', products=[], categories=[], error=True)
-    prods = products_df[['product_id','product_name','category','price']].to_dict(orient='records')
-    cats  = sorted(products_df['category'].unique().tolist())
-    return render_template('index.html', products=prods, categories=cats, error=False)
+# ── GRADIO UI ─────────────────────────────
+demo = gr.Interface(
+    fn=recommend_from_cart,
+    inputs=[
+        gr.Textbox(
+            label="Enter Cart Product IDs (comma separated)",
+            placeholder="e.g. 1,2,3"
+        ),
+        gr.Slider(1, 20, value=8, label="Top N Recommendations")
+    ],
+    outputs=gr.Textbox(label="Recommended Products"),
+    title="🛍️ Product Recommendation System",
+    description="Enter product IDs from your cart and get smart ML-based recommendations."
+)
 
-
-@app.route('/api/recommend-from-cart', methods=['POST'])
-def cart_recommend():
-    if not artifacts_loaded:
-        return jsonify({'error': 'Model not loaded'}), 503
-    body = request.get_json()
-    if not body or 'cart' not in body or not body['cart']:
-        return jsonify({'recommendations': [], 'message': 'Cart is empty'})
-    try:
-        results = recommend_from_cart(body['cart'], top_n=int(body.get('top_n', 8)))
-        return jsonify({'recommendations': results, 'cart_size': len(body['cart'])})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/stats')
-def stats():
-    if not artifacts_loaded:
-        return jsonify({'error': 'Model not loaded'}), 503
-    return jsonify({
-        'n_products': int(len(products_df)),
-        'n_ratings':  int((~rating_matrix.isna()).sum().sum()),
-        'density':    round(float((~rating_matrix.isna()).sum().sum() / rating_matrix.size * 100), 1),
-        'categories': int(products_df['category'].nunique()),
-    })
-
-
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+demo.launch()
